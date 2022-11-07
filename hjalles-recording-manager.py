@@ -3,19 +3,23 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 
 import obspython as obs
 
 import psutil
 
-__version__ = "1.0.1"
+import threading
+import glob
+
+__version__ = "1.1.0-alpha.3"
+
+SETTINGS = None
+SCRIPT_PROPERTIES = None
 
 
 def script_description():
-    return f"<b>Hjalles Recording Manager</b> v. {__version__}" + \
-           "<hr>" + \
-           "More features will come soon." + \
-           "<hr>"
+    return f"<b>Hjalles Recording Manager</b> v. {__version__}"
 
 
 def script_load(settings):
@@ -34,9 +38,15 @@ def script_load(settings):
                                                               "BF2042.exe, Battlefield 2042, BF2042\n"
                                                               "bfv.exe, Battlefield V, BF5"))
 
+    obs.obs_data_set_default_string(settings, "RemuxFilenameFormat", "%FILE%_remux")
+    obs.obs_data_set_default_int(settings, "RemuxCRF", 23)
+    obs.obs_data_set_default_string(settings, "RemuxH264Preset", "medium")
+
 
 def script_update(settings):
-    global SETTINGS, RECORDING_DIR, FILENAME_FORMAT, ENABLE_FILE_SORT, SORT_BY_DATE, DATE_SORT_SCHEME, FILE_SORT_BY, EXE_PREFIXES, EXE_LIST, FILE_OVERWRITE
+    global SETTINGS, SCRIPT_PROPERTIES
+
+    SCRIPT_PROPERTIES = settings
 
     SETTINGS["RecordingOutDir"] = obs.obs_data_get_string(settings, "RecordingOutDir")
     SETTINGS["OverwriteExistingFile"] = obs.obs_data_get_bool(settings, "OverwriteExistingFile")
@@ -49,6 +59,22 @@ def script_update(settings):
     SETTINGS["RecordingSortType"] = obs.obs_data_get_string(settings, "RecordingSortType")
     SETTINGS["ExeSortPrefixes"] = obs.obs_data_get_bool(settings, "ExeSortPrefixes")
     SETTINGS["ExeSortList"] = obs.obs_data_get_string(settings, "ExeSortList")
+
+    SETTINGS["RemuxRecordings"] = obs.obs_data_get_bool(settings, "RemuxRecordings")
+    SETTINGS["RemuxMode"] = obs.obs_data_get_string(settings, "RemuxMode")
+    SETTINGS["RemuxFilenameFormat"] = obs.obs_data_get_string(settings, "RemuxFilenameFormat")
+    SETTINGS["RemuxVEncoder"] = obs.obs_data_get_string(settings, "RemuxVEncoder")
+    SETTINGS["RemuxCRF"] = obs.obs_data_get_int(settings, "RemuxCRF")
+    SETTINGS["RemuxFileContainer"] = obs.obs_data_get_string(settings, "RemuxFileContainer")
+    SETTINGS["RemuxBitrate"] = obs.obs_data_get_int(settings, "RemuxBitrate")
+
+    SETTINGS["RemuxCustomFFmpeg"] = obs.obs_data_get_string(settings, "RemuxCustomFFmpeg")
+
+    SETTINGS["RemuxH264Preset"] = obs.obs_data_get_string(settings, "RemuxH264Preset")
+
+    SETTINGS["ManualRemuxMode"] = obs.obs_data_get_string(settings, "ManualRemuxMode")
+    SETTINGS["ManualRemuxInputFile"] = obs.obs_data_get_string(settings, "ManualRemuxInputFile")
+    SETTINGS["ManualRemuxInputFolder"] = obs.obs_data_get_string(settings, "ManualRemuxInputFolder")
 
 
 def file_sorting_modified(props, prop, settings, *args, **kwargs):
@@ -63,6 +89,157 @@ def file_sorting_modified(props, prop, settings, *args, **kwargs):
         obs.obs_property_set_visible(exe_prefixes, True)
 
     return True  # VERY IMPORTANT
+
+
+def remux_settings_modified(props, prop, settings, *args, **kwargs):
+    remux_file_format = obs.obs_properties_get(props, "RemuxFilenameFormat")
+    if obs.obs_data_get_bool(settings, "RemuxReplaceOriginal"):
+        obs.obs_property_set_enabled(remux_file_format, False)
+    else:
+        obs.obs_property_set_enabled(remux_file_format, True)
+
+    # Get all UI elements for remux settings
+
+    overwrite_b = obs.obs_properties_get(props, "RemuxReplaceOriginal")
+    v_encoder_s = obs.obs_properties_get(props, "RemuxVEncoder")
+    container_prop = obs.obs_properties_get(props, "RemuxFileContainer")
+    br_slider = obs.obs_properties_get(props, "RemuxBitrate")
+    crf_slider = obs.obs_properties_get(props, "RemuxCRF")
+    preset_selector = obs.obs_properties_get(props, "RemuxH264Preset")
+    filename_format = obs.obs_properties_get(props, "RemuxFilenameFormat")
+    custom_ffmpeg = obs.obs_properties_get(props, "RemuxCustomFFmpeg")
+
+    remux_mode = obs.obs_data_get_string(settings, "RemuxMode")
+    v_encoder = obs.obs_data_get_string(settings, "RemuxVEncoder")
+    h264_preset = obs.obs_data_get_string(settings, "RemuxH264Preset")
+    containers = []
+
+    # Visble properties in standard mode
+    std_props = [overwrite_b, v_encoder_s, container_prop, br_slider, crf_slider, preset_selector, filename_format]
+    # Visible properties in custom ffmpeg mode
+    custom_props = [custom_ffmpeg, filename_format, overwrite_b]
+
+    obs.obs_property_list_clear(container_prop)
+    obs.obs_property_list_clear(preset_selector)
+    if remux_mode == "standard":
+        for p in custom_props:
+            obs.obs_property_set_visible(p, False)
+        for p in std_props:
+            obs.obs_property_set_visible(p, True)
+
+        if v_encoder == "copy":
+            containers = [("mp4", "mp4 - MPEG-4"), ("mkv", "mkv - Matroska")]
+            copy_props = [container_prop, v_encoder_s, filename_format, overwrite_b]
+            for prop in copy_props:
+                obs.obs_property_set_visible(prop, True)
+            for prop in std_props:
+                if prop not in copy_props:
+                    obs.obs_property_set_visible(prop, False)
+
+        elif v_encoder == "libx264":
+            containers = [("mp4", "mp4 - MPEG-4"), ("mkv", "mkv - Matroska")]
+            libx264_props = [overwrite_b, v_encoder_s, filename_format, container_prop, crf_slider, preset_selector]
+            for p in libx264_props:
+                obs.obs_property_set_visible(p, True)
+            for p in std_props:
+                if p not in libx264_props:
+                    obs.obs_property_set_visible(p, False)
+            for preset in ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower",
+                           "veryslow", "placebo"]:
+                obs.obs_property_list_add_string(preset_selector, preset, preset)
+
+        elif v_encoder == "h264_nvenc":
+            containers = [("mp4", "mp4 - MPEG-4"), ("mkv", "mkv - Matroska")]
+            h264nvenc_props = [overwrite_b, v_encoder_s, filename_format, container_prop, br_slider, preset_selector]
+            for p in h264nvenc_props:
+                obs.obs_property_set_visible(p, True)
+            for p in std_props:
+                if p not in h264nvenc_props:
+                    obs.obs_property_set_visible(p, False)
+            for preset in [("default", 0), ("slow", 1), ("medium", 2), ("fast", 3), ("hp", 4), ("hq", 5), ("bd", 6),
+                           ("ll", 7), ("llhq", 8), ("llhp", 9), ("lossless", 10), ("losslesshp", 11)]:
+                obs.obs_property_list_add_string(preset_selector, preset[0], str(preset[1]))
+
+        # elif v_encoder == "h264_amf":
+        #     amf_props = [overwrite_b, v_encoder_s, filename_format, br_slider, container_prop]
+        #     for prop in amf_props:
+        #         obs.obs_property_set_visible(prop, True)
+        #     for prop in std_props:
+        #         if prop not in amf_props:
+        #             obs.obs_property_set_visible(prop, False)
+        #     containers = [("mp4", "mp4 - MPEG-4"), ("mkv", "mkv - Matroska")]
+        for c in containers:
+            obs.obs_property_list_add_string(container_prop, c[1], c[0])
+
+    elif remux_mode == "custom_ffmpeg":
+        for p in std_props:
+            obs.obs_property_set_visible(p, False)
+        for p in custom_props:
+            obs.obs_property_set_visible(p, True)
+
+    manual_remux_mode = obs.obs_data_get_string(settings, "ManualRemuxMode")
+    manual_remux_file = obs.obs_properties_get(props, "ManualRemuxInputFile")
+    manual_remux_folder= obs.obs_properties_get(props, "ManualRemuxInputFolder")
+    if manual_remux_mode == "file":
+        obs.obs_property_set_visible(manual_remux_file, True)
+        obs.obs_property_set_visible(manual_remux_folder, False)
+    elif manual_remux_mode == "batch":
+        obs.obs_property_set_visible(manual_remux_file, False)
+        obs.obs_property_set_visible(manual_remux_folder, True)
+
+    return True
+
+
+def generate_ffmpeg_cmd(input_path):
+    global SETTINGS
+
+    input_file = pathlib.Path(input_path)
+    filename_format = SETTINGS["RemuxFilenameFormat"]
+    stem = filename_format.replace("%FILE%", input_file.stem)
+    container = SETTINGS["RemuxFileContainer"]
+    output_filename = f"{stem}.{container}"
+    output_path = os.path.join(input_file.parent, output_filename)
+    if SETTINGS["RemuxMode"] == "standard":
+        v_encoder = SETTINGS["RemuxVEncoder"]
+        if v_encoder == "copy":
+            ffmpeg_cmd = f"ffmpeg -i {input_path} -c:v copy -c:a copy -map 0 {output_path}"
+        elif v_encoder == "libx264":
+            crf = SETTINGS["RemuxCRF"]
+            preset = SETTINGS["RemuxH264Preset"]
+            ffmpeg_cmd = f"ffmpeg -i {input_path} -c:v {v_encoder} -preset 0 -crf {crf} -c:a copy -map 0 {output_path}"
+        elif v_encoder == "h264_nvenc":
+            cbr = SETTINGS["RemuxBitrate"]
+            preset = SETTINGS["RemuxH264Preset"]
+            ffmpeg_cmd = f"ffmpeg -i {input_path} -c:v h264_nvenc -preset {preset} -b:v {cbr}M -c:a copy -map 0 {output_path}"
+        # elif v_encoder == "h264_amf":
+        #     cbr = int(SETTINGS["RemuxBitrate"]) * 1000
+    elif SETTINGS["RemuxMode"] == "custom_ffmpeg":
+        ffmpeg_cmd = SETTINGS["RemuxCustomFFmpeg"].replace("%INPUT%", input_path).replace("%OUTPUT%", stem)
+
+    return ffmpeg_cmd
+
+
+def manual_remux(props, prop, *args, **kwargs):
+
+    if SETTINGS["ManualRemuxMode"] == "file":
+        ffmpeg_input = SETTINGS["ManualRemuxInputFile"]
+        ffmpeg_cmd = generate_ffmpeg_cmd(ffmpeg_input)
+        remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,), daemon=True)
+        remux_thread.start()
+    elif SETTINGS["ManualRemuxMode"] == "batch":
+        input_folder = SETTINGS["ManualRemuxInputFolder"]
+        file_formats = ["mp4", "mkv"]
+        input_files = []
+        for ff in file_formats:
+            input_files += glob.glob(f"{input_folder}/*.{ff}")
+        remux_threads = []
+        for file in input_files:
+            ffmpeg_cmd = generate_ffmpeg_cmd(file)
+            thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
+            remux_threads.append(thread)
+        for thread in remux_threads:
+            thread.start()
+
 
 
 def script_properties():
@@ -102,6 +279,82 @@ def script_properties():
                                            type=obs.OBS_TEXT_MULTILINE)
     file_sorting_menu = obs.obs_properties_add_group(props, "SortRecordings", "Automatic file labeling and sorting",
                                                      obs.OBS_GROUP_CHECKABLE, file_sorting_props)
+
+    # ===== REMUXING OPTIONS =====
+    auto_remux_props = obs.obs_properties_create()
+    replace_orig = obs.obs_properties_add_bool(auto_remux_props, "RemuxReplaceOriginal", "Overwrite original file")
+    remux_filename = obs.obs_properties_add_text(auto_remux_props, "RemuxFilenameFormat",
+                                                 "Remuxed filename format",
+                                                 type=obs.OBS_TEXT_DEFAULT)
+    auto_remux_menu = obs.obs_properties_add_group(props, "RemuxRecordings", "Automatically remux recordings",
+                                                   obs.OBS_GROUP_CHECKABLE, auto_remux_props)
+
+    remux_props = obs.obs_properties_create()
+
+
+
+    remux_mode = obs.obs_properties_add_list(remux_props, "RemuxMode", "Mode",
+                                             type=obs.OBS_COMBO_TYPE_LIST, format=obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(remux_mode, "Standard", "standard")
+    obs.obs_property_list_add_string(remux_mode, "Custom FFmpeg", "custom_ffmpeg")
+    obs.obs_property_set_modified_callback(remux_mode, remux_settings_modified)
+
+
+    obs.obs_property_set_modified_callback(replace_orig, remux_settings_modified)
+    v_encoder = obs.obs_properties_add_list(remux_props, "RemuxVEncoder", "Encoding",
+                                            type=obs.OBS_COMBO_TYPE_LIST, format=obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_set_modified_callback(v_encoder, remux_settings_modified)
+
+    obs.obs_property_list_add_string(v_encoder, "Copy encoding", "copy")
+
+    obs.obs_property_list_add_string(v_encoder, "H.264 (libx264)", "libx264")
+    crf_slider = obs.obs_properties_add_int_slider(remux_props, "RemuxCRF", "CRF", min=0, max=51, step=1)
+    br_slider = obs.obs_properties_add_int_slider(remux_props, "RemuxBitrate", "CBR (mbps)", min=1, max=100, step=1)
+
+    h264_preset = obs.obs_properties_add_list(remux_props, "RemuxH264Preset", "Preset", type=obs.OBS_COMBO_TYPE_LIST,
+                                              format=obs.OBS_COMBO_FORMAT_STRING)
+    # # for preset in ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow",
+    # #                "placebo"]:
+    #     obs.obs_property_list_add_string(h264_preset, preset, preset)
+
+    obs.obs_property_list_add_string(v_encoder, "H.264 (Nvidia NVENC)", "h264_nvenc")
+
+    #obs.obs_property_list_add_string(v_encoder, "H.264 (AMD AMF)", "h264_amf")
+
+    container = obs.obs_properties_add_list(remux_props, "RemuxFileContainer", "File container",
+                                            type=obs.OBS_COMBO_TYPE_LIST,
+                                            format=obs.OBS_COMBO_FORMAT_STRING)
+
+    custom_ffmpeg = obs.obs_properties_add_text(remux_props, "RemuxCustomFFmpeg", "Custom FFmpeg command",
+                                                obs.OBS_TEXT_DEFAULT)
+
+    remux_info = obs.obs_properties_add_text(remux_props, "RemuxInfo", "For information refer to the <a "
+                                                                       "href='https://trac.ffmpeg.org/wiki'>FFmpeg "
+                                                                       "wiki</a>.", type=obs.OBS_TEXT_INFO)
+
+    remux_menu = obs.obs_properties_add_group(props, "RemuxMenu", "Remux settings",
+                                              obs.OBS_GROUP_NORMAL, remux_props)
+
+    # ===== Manual remuxing =====
+    manual_remux_props = obs.obs_properties_create()
+    manual_remux_mode = obs.obs_properties_add_list(manual_remux_props, "ManualRemuxMode", "Mode",
+                                                    type=obs.OBS_COMBO_TYPE_LIST,
+                                                    format=obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_set_modified_callback(manual_remux_mode, remux_settings_modified)
+    obs.obs_property_list_add_string(manual_remux_mode, "Single file", "file")
+    obs.obs_property_list_add_string(manual_remux_mode, "Batch", "batch")
+
+    obs.obs_properties_add_path(manual_remux_props, "ManualRemuxInputFile", "Input file", obs.OBS_PATH_FILE, "", "")
+    obs.obs_properties_add_path(manual_remux_props, "ManualRemuxInputFolder", "Input folder", obs.OBS_PATH_DIRECTORY, "",
+                                SETTINGS["RecordingOutDir"])
+    # obs.obs_properties_add_path(manual_remux_props, "ManualRemuxOutputFile", "Output file", obs.OBS_PATH_FILE_SAVE, "",
+    #                             "")
+    obs.obs_properties_add_button(manual_remux_props, "StartManualRemux", "Convert", manual_remux)
+
+    manual_remux_menu = obs.obs_properties_add_group(props, "ManualRemuxMenu", "Manual remux",
+                                                     obs.OBS_GROUP_NORMAL, manual_remux_props)
+
+    obs.obs_properties_apply_settings(props, SCRIPT_PROPERTIES)
 
     return props
 
@@ -184,6 +437,8 @@ def save_recording(input_file, output_dir):
             num += 1
     shutil.move(input_file, new_path)
 
+    return new_path
+
 
 def generate_dir(root_dir):
     global SETTINGS
@@ -204,9 +459,21 @@ def generate_dir(root_dir):
     return return_dir
 
 
+def run_ffmpeg(ffmpeg_cmd):
+    p = subprocess.run(ffmpeg_cmd, shell=True)
+    return
+
+
 def on_event(event):
     global SETTINGS
     if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED:
         recording_path = pathlib.Path(get_latest_recording_path())
         new_dir = generate_dir(SETTINGS["RecordingOutDir"])
-        save_recording(recording_path, new_dir)
+        output = save_recording(recording_path, new_dir)
+
+        if not SETTINGS["RemuxRecordings"]:
+            return
+        ffmpeg_input = output
+        ffmpeg_cmd = generate_ffmpeg_cmd(ffmpeg_input)
+        remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
+        remux_thread.start()
