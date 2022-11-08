@@ -6,14 +6,21 @@ import pathlib
 import shutil
 import subprocess
 import threading
+import time
 
 import obspython as obs
 import psutil
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 SETTINGS = None
 SCRIPT_PROPERTIES = None
+CURRENT_RECORDING = {
+    "start_time": None,
+    "time_splits": [],
+    "total_size": 0,
+    "total_time": 0
+}
 
 
 def script_description():
@@ -30,7 +37,7 @@ def script_load(settings):
     output_path = obs.obs_frontend_get_current_record_output_path()
     obs.obs_data_set_default_string(settings, "RecordingOutDir", output_path)
     obs.obs_data_set_default_string(settings, "FilenameFormat", "%Y-%m-%d_%H-%M-%S")
-    obs.obs_data_set_default_string(settings, "DateSortScheme", "%Y-%m-%d/")
+    obs.obs_data_set_default_string(settings, "DatetimeSortScheme", "%Y-%m-%d/")
     obs.obs_data_set_default_string(settings, "ExeSortList", ("bf4.exe, Battlefield 4, BF4\n"
                                                               "TslGame.exe, PUBG, PUBG\n"
                                                               "BF2042.exe, Battlefield 2042, BF2042\n"
@@ -39,6 +46,8 @@ def script_load(settings):
     obs.obs_data_set_default_string(settings, "RemuxFilenameFormat", "%FILE%_remux")
     obs.obs_data_set_default_int(settings, "RemuxCRF", 23)
     obs.obs_data_set_default_string(settings, "RemuxH264Preset", "medium")
+
+    obs.timer_add(split_file, 1000)
 
 
 def script_update(settings):
@@ -53,10 +62,16 @@ def script_update(settings):
 
     SETTINGS["SortRecordings"] = obs.obs_data_get_bool(settings, "SortRecordings")
     SETTINGS["SortByDate"] = obs.obs_data_get_bool(settings, "SortByDate")
-    SETTINGS["DateSortScheme"] = obs.obs_data_get_string(settings, "DateSortScheme")
+    SETTINGS["DatetimeSortScheme"] = obs.obs_data_get_string(settings, "DatetimeSortScheme")
     SETTINGS["RecordingSortType"] = obs.obs_data_get_string(settings, "RecordingSortType")
     SETTINGS["ExeSortPrefixes"] = obs.obs_data_get_bool(settings, "ExeSortPrefixes")
     SETTINGS["ExeSortList"] = obs.obs_data_get_string(settings, "ExeSortList")
+
+    SETTINGS["EnableSplitRecording"] = obs.obs_data_get_bool(settings, "EnableSplitRecording")
+    SETTINGS["SplitMaxSize"] = obs.obs_data_get_double(settings, "SplitMaxSize")
+    SETTINGS["SplitMaxTime"] = obs.obs_data_get_double(settings, "SplitMaxTime")
+    SETTINGS["SplitGatherFiles"] = obs.obs_data_get_bool(settings, "SplitGatherFiles")
+    SETTINGS["SplitConcatenate"] = obs.obs_data_get_bool(settings, "SplitConcatenate")
 
     SETTINGS["RemuxRecordings"] = obs.obs_data_get_bool(settings, "RemuxRecordings")
     SETTINGS["RemuxMode"] = obs.obs_data_get_string(settings, "RemuxMode")
@@ -66,11 +81,8 @@ def script_update(settings):
     SETTINGS["RemuxFileContainer"] = obs.obs_data_get_string(settings, "RemuxFileContainer")
     SETTINGS["RemuxBitrate"] = obs.obs_data_get_int(settings, "RemuxBitrate")
     SETTINGS["RemuxBitrateMode"] = obs.obs_data_get_string(settings, "RemuxBitrateMode")
-
     SETTINGS["RemuxCustomFFmpeg"] = obs.obs_data_get_string(settings, "RemuxCustomFFmpeg")
-
     SETTINGS["RemuxH264Preset"] = obs.obs_data_get_string(settings, "RemuxH264Preset")
-
     SETTINGS["ManualRemuxMode"] = obs.obs_data_get_string(settings, "ManualRemuxMode")
     SETTINGS["ManualRemuxInputFile"] = obs.obs_data_get_string(settings, "ManualRemuxInputFile")
     SETTINGS["ManualRemuxInputFolder"] = obs.obs_data_get_string(settings, "ManualRemuxInputFolder")
@@ -267,28 +279,86 @@ def manual_remux(props, prop, *args, **kwargs):
             thread.start()
 
 
-def script_properties():
-    props = obs.obs_properties_create()
+def find_latest_file(directory, file_ext=[], exclude=[]):
+    list_of_files = glob.glob(directory + "/*") + glob.glob(directory + "/.**")
 
-    recording_props = obs.obs_properties_create()
-    recording_dir = obs.obs_properties_add_path(recording_props, "RecordingOutDir", "Recording output directory",
-                                                obs.OBS_PATH_DIRECTORY, "", "")
-    recording_menu = obs.obs_properties_add_group(props, "_recording_menu", "Recording settings", obs.OBS_GROUP_NORMAL,
-                                                  recording_props)
+    return_files = []
+    for file in list_of_files:
+        add = True
+        if os.path.isdir(file):
+            continue
+        if len(file_ext) > 0:
+            ext = file.split(".")[-1]
+            if ext not in file_ext:
+                add = False
+                continue
+        if len(exclude) > 0:
+            for x in exclude:
+                if os.path.abspath(x) == os.path.abspath(file):
+                    add = False
+                    continue
 
-    filename_props = obs.obs_properties_create()
-    filename_format = obs.obs_properties_add_text(filename_props, "FilenameFormat", "Filename format",
-                                                  type=obs.OBS_TEXT_DEFAULT)
-    overwrite = obs.obs_properties_add_bool(filename_props, "OverwriteExistingFile", "Overwrite if file exists")
-    filename_format_menu = obs.obs_properties_add_group(props, "_filename_format_menu",
-                                                        "Filename formatting (recording only)",
-                                                        obs.OBS_GROUP_NORMAL, filename_props)
+        if add:
+            return_files.append(file)
+    return sorted(return_files, key=lambda t: -os.stat(t).st_mtime)[0]
 
+
+def split_file():
+    global CURRENT_RECORDING
+
+    if obs.obs_frontend_recording_active():
+        if SETTINGS["EnableSplitRecording"]:
+            max_size = SETTINGS["SplitMaxSize"]
+            max_time = SETTINGS["SplitMaxTime"]
+            output = obs.obs_frontend_get_recording_output()
+            # Output file size in GB
+            size = obs.obs_output_get_total_bytes(output) / (10**9) - CURRENT_RECORDING["total_size"]  # 1 GB = 10^9 bytes
+            current_time = (datetime.datetime.now() - CURRENT_RECORDING["start_time"]).seconds // 60 - CURRENT_RECORDING["total_time"]
+
+            if size >= max_size != 0:
+                print("== Recording split (size)")
+                total_size = CURRENT_RECORDING["total_size"] + size
+                total_time = CURRENT_RECORDING["total_time"] + current_time
+                CURRENT_RECORDING["total_size"] = total_size
+                CURRENT_RECORDING["total_time"] = total_time
+                obs.obs_frontend_recording_split_file()
+                path = find_latest_file(obs.obs_frontend_get_current_record_output_path())
+                CURRENT_RECORDING["time_splits"].append((path, datetime.datetime.now()))
+
+            elif current_time >= max_time != 0:
+                print("== Recording split (time)")
+                total_size = CURRENT_RECORDING["total_size"] + size
+                total_time = CURRENT_RECORDING["total_time"] + current_time
+                CURRENT_RECORDING["total_size"] = total_size
+                CURRENT_RECORDING["total_time"] = total_time
+                obs.obs_frontend_recording_split_file()
+                path = find_latest_file(obs.obs_frontend_get_current_record_output_path())
+                CURRENT_RECORDING["time_splits"].append((path, datetime.datetime.now()))
+
+
+
+
+def file_split_props(props):
+    split_props = obs.obs_properties_create()
+
+    obs.obs_properties_add_float_slider(split_props, "SplitMaxSize", "Max size (GB)", 0, 100, 0.1)
+    obs.obs_properties_add_int_slider(split_props, "SplitMaxTime", "Max time (min)", 0, 120, 1)
+
+    obs.obs_properties_add_bool(split_props, "SplitGatherFiles", "Gather split files in folder")
+    obs.obs_properties_add_bool(split_props, "SplitConcatenate", "Concatenate split files")
+
+    split_menu = obs.obs_properties_add_group(props, "EnableSplitRecording", "Automatic file splitting",
+                                              obs.OBS_GROUP_CHECKABLE, split_props)
+
+    return props
+
+
+def file_sorting_properties(props):
     # ===== FILE SORTING OPTIONS =====
     file_sorting_props = obs.obs_properties_create()
 
     sort_by_date = obs.obs_properties_add_bool(file_sorting_props, "SortByDate", "Sort files by date")
-    date_sort_scheme = obs.obs_properties_add_text(file_sorting_props, "DateSortScheme", "Date sorting scheme",
+    date_sort_scheme = obs.obs_properties_add_text(file_sorting_props, "DatetimeSortScheme", "Date sorting scheme",
                                                    type=obs.OBS_TEXT_DEFAULT)
     obs.obs_property_set_enabled(date_sort_scheme, False)
 
@@ -305,6 +375,10 @@ def script_properties():
     file_sorting_menu = obs.obs_properties_add_group(props, "SortRecordings", "Automatic file labeling and sorting",
                                                      obs.OBS_GROUP_CHECKABLE, file_sorting_props)
 
+    return props
+
+
+def remux_properties(props):
     # ===== REMUXING OPTIONS =====
     auto_remux_props = obs.obs_properties_create()
     replace_orig = obs.obs_properties_add_bool(auto_remux_props, "RemuxReplaceOriginal", "Overwrite original file")
@@ -380,6 +454,30 @@ def script_properties():
     manual_remux_menu = obs.obs_properties_add_group(props, "ManualRemuxMenu", "Manual remux",
                                                      obs.OBS_GROUP_NORMAL, manual_remux_props)
 
+    return props
+
+
+def script_properties():
+    props = obs.obs_properties_create()
+
+    recording_props = obs.obs_properties_create()
+    recording_dir = obs.obs_properties_add_path(recording_props, "RecordingOutDir", "Recording output directory",
+                                                obs.OBS_PATH_DIRECTORY, "", "")
+    recording_menu = obs.obs_properties_add_group(props, "_recording_menu", "Recording settings", obs.OBS_GROUP_NORMAL,
+                                                  recording_props)
+
+    filename_props = obs.obs_properties_create()
+    filename_format = obs.obs_properties_add_text(filename_props, "FilenameFormat", "Filename format",
+                                                  type=obs.OBS_TEXT_DEFAULT)
+    overwrite = obs.obs_properties_add_bool(filename_props, "OverwriteExistingFile", "Overwrite if file exists")
+    filename_format_menu = obs.obs_properties_add_group(props, "_filename_format_menu",
+                                                        "Filename formatting (recording only)",
+                                                        obs.OBS_GROUP_NORMAL, filename_props)
+
+    props = file_sorting_properties(props)
+    props = file_split_props(props)
+    props = remux_properties(props)
+
     obs.obs_properties_apply_settings(props, SCRIPT_PROPERTIES)
 
     return props
@@ -424,10 +522,12 @@ def get_latest_recording_path():
     return json.loads(json_str)["path"]
 
 
-def generate_filename(prefix="", suffix="", file_ext=""):
+def generate_filename(prefix="", suffix="", file_ext="", timestamp=None):
     global SETTINGS
     file_ext = file_ext.replace(".", "")
-    filename = datetime.datetime.now().strftime(SETTINGS["FilenameFormat"])
+    if timestamp is None:
+        timestamp = datetime.datetime.now()
+    filename = timestamp.strftime(SETTINGS["FilenameFormat"])
     if prefix is not "":
         filename = f"{prefix}_{filename}"
     if suffix is not "":
@@ -437,7 +537,7 @@ def generate_filename(prefix="", suffix="", file_ext=""):
     return filename
 
 
-def save_recording(input_file, output_dir):
+def save_recording(input_file, output_dir, timestamp=None, get_path_only=False):
     global SETTINGS
     file_ext = input_file.suffix
     if len(input_file.name.split(".")[0]) == 0:  # Empty filename, e.g. ".mp4"
@@ -447,7 +547,9 @@ def save_recording(input_file, output_dir):
         active_exe = find_exe_from_list()
         if active_exe is not None:
             prefix = active_exe["prefix"]
-    new_filename = generate_filename(prefix=prefix, file_ext=file_ext)
+    if timestamp is None:
+        timestamp = datetime.datetime.now()
+    new_filename = generate_filename(prefix=prefix, file_ext=file_ext, timestamp=timestamp)
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
     new_path = os.path.join(output_dir, new_filename)
     if not SETTINGS["OverwriteExistingFile"]:
@@ -461,7 +563,8 @@ def save_recording(input_file, output_dir):
                 new_path = test_path
                 break
             num += 1
-    shutil.move(input_file, new_path)
+    if not get_path_only:
+        shutil.move(input_file, new_path)
 
     return new_path
 
@@ -480,7 +583,7 @@ def generate_dir(root_dir):
                 name = active_exe["name"]
                 return_dir = os.path.join(return_dir, name)
         if SETTINGS["SortByDate"]:
-            date_path = datetime.datetime.now().strftime(SETTINGS["DateSortScheme"])
+            date_path = datetime.datetime.now().strftime(SETTINGS["DatetimeSortScheme"])
             return_dir = os.path.join(return_dir, date_path)
     return return_dir
 
@@ -490,16 +593,79 @@ def run_ffmpeg(ffmpeg_cmd):
     return
 
 
-def on_event(event):
-    global SETTINGS
-    if event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED:
-        recording_path = pathlib.Path(get_latest_recording_path())
-        new_dir = generate_dir(SETTINGS["RecordingOutDir"])
-        output = save_recording(recording_path, new_dir)
+def run_many_ffmpegs(ffmpeg_cmds):
+    for cmd in ffmpeg_cmds:
+        subprocess.run(cmd, shell=True)
 
-        if not SETTINGS["RemuxRecordings"]:
-            return
-        ffmpeg_input = output
-        ffmpeg_cmd = generate_ffmpeg_cmd(ffmpeg_input)
-        remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
-        remux_thread.start()
+
+def on_event(event):
+    global SETTINGS, CURRENT_RECORDING
+
+    if event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED:
+        start_time = datetime.datetime.now()
+        CURRENT_RECORDING = {
+            "start_time": datetime.datetime.now(),
+            "time_splits": [],
+            "total_size": 0,
+            "total_time": 0
+        }
+        print("===== RECORDING STARTED =====", f"\n{start_time}\n")
+
+    elif event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED:
+        end_time = datetime.datetime.now()
+        print("\n===== RECORDING STOPPED =====", f"\n{end_time}")
+
+        if not SETTINGS["EnableSplitRecording"]:
+            recording_path = pathlib.Path(get_latest_recording_path())
+            new_dir = generate_dir(SETTINGS["RecordingOutDir"])
+            output = save_recording(recording_path, new_dir)
+            print(f"Saved recording -> {output}")
+
+            if SETTINGS["RemuxRecordings"]:
+                print("Remuxing recording...")
+                ffmpeg_input = output
+                ffmpeg_cmd = generate_ffmpeg_cmd(ffmpeg_input)
+                remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
+                remux_thread.start()
+
+        if SETTINGS["EnableSplitRecording"]:
+            new_dir = generate_dir(SETTINGS["RecordingOutDir"])
+            if SETTINGS["SplitGatherFiles"]:
+                timestamp = end_time.strftime(SETTINGS["FilenameFormat"])
+                split_dir = os.path.join(new_dir, timestamp)
+                print(f"Gathering split files -> {split_dir}/")
+            else:
+                split_dir = new_dir
+            path = find_latest_file(obs.obs_frontend_get_current_record_output_path())
+            CURRENT_RECORDING["time_splits"].append((path, datetime.datetime.now()))
+            concat_str = ""
+            for split in CURRENT_RECORDING["time_splits"]:
+                path = pathlib.Path(split[0])
+                timestamp = split[1]
+                output_path = save_recording(path, split_dir, timestamp=timestamp)
+                concat_str += f"file '{output_path}'\n"
+
+            if SETTINGS["SplitConcatenate"]:
+                input_file = CURRENT_RECORDING["time_splits"][0][0]
+                input_path = pathlib.Path(input_file)
+                concat_path = save_recording(input_path, new_dir, timestamp=end_time,
+                                             get_path_only=True)
+                print(f"Concatenating split files -> {concat_path}")
+                with open("concat.txt", "w") as f:
+                    f.write(concat_str)
+
+                if SETTINGS["RemuxRecordings"]:
+                    print("Remuxing concatenated file...")
+                    concat_cmd = f"ffmpeg -f concat -safe 0 -i concat.txt -c copy {concat_path}"
+                    remux_cmd = generate_ffmpeg_cmd(concat_path)
+                    ffmpeg_cmds = [concat_cmd, remux_cmd]
+                    remux_thread = threading.Thread(target=run_many_ffmpegs, args=(ffmpeg_cmds,))
+                    remux_thread.start()
+
+                else:
+                    ffmpeg_cmd = f"ffmpeg -f concat -safe 0 -i concat.txt -c copy {concat_path}"
+                    remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
+                    remux_thread.start()
+
+
+
